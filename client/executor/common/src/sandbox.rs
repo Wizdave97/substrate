@@ -380,7 +380,7 @@ impl<FR> SandboxInstance<FR> {
 	///
 	/// The `state` parameter can be used to provide custom data for
 	/// these syscall implementations.
-	pub fn invoke<'a, FE, SCH, DTH>(
+	pub fn invoke<FE>(
 		&self,
 
 		// function to call that is exported from the module
@@ -391,13 +391,9 @@ impl<FR> SandboxInstance<FR> {
 
 		// arbitraty context data of the call
 		state: u32,
-	) -> std::result::Result<Option<wasmi::RuntimeValue>, wasmi::Error>
-	where
-		FE: SandboxCapabilities<SupervisorFuncRef = FR> + 'a,
-		SCH: SandboxCapabilitiesHolder<SupervisorFuncRef = FR, SC = FE>,
-		DTH: DispatchThunkHolder<DispatchThunk = FR>,
-	{
-		SCH::with_sandbox_capabilities(|supervisor_externals| {
+
+		supervisor_externals: &mut FE,
+	) -> std::result::Result<Option<wasmi::RuntimeValue>, wasmi::Error> where FE: SandboxCapabilities<SupervisorFuncRef = FR> {
 			with_guest_externals(supervisor_externals, self, state, |guest_externals| {
 				match &self.backend_instance {
 					BackendInstance::Wasmi(wasmi_instance) => {
@@ -424,35 +420,37 @@ impl<FR> SandboxInstance<FR> {
 							})
 							.collect();
 
-						let wasmer_result =
-							DTH::initialize_thunk(&self.dispatch_thunk, || function.call(&args))
-								.map_err(|error| wasmi::Error::Function(error.to_string()))?;
+						let wasmer_result = function
+							.call(&args)
+							.map_err(|error| wasmi::Error::Function(error.to_string()))?;
 
 						if wasmer_result.len() > 1 {
 							return Err(wasmi::Error::Function(
-								"multiple return types are not supported yet".to_owned(),
+								"multiple return types are not supported yet".into(),
 							))
 						}
 
-						let wasmer_result = if let Some(wasmer_value) = wasmer_result.first() {
-							let wasmer_value = match *wasmer_value {
-								wasmer::Val::I32(val) => RuntimeValue::I32(val),
-								wasmer::Val::I64(val) => RuntimeValue::I64(val),
-								wasmer::Val::F32(val) => RuntimeValue::F32(val.into()),
-								wasmer::Val::F64(val) => RuntimeValue::F64(val.into()),
-								_ => unreachable!(),
-							};
+						wasmer_result
+							.first()
+							.map(|wasm_value| {
+								let wasmer_value = match *wasm_value {
+									wasmer::Val::I32(val) => RuntimeValue::I32(val),
+									wasmer::Val::I64(val) => RuntimeValue::I64(val),
+									wasmer::Val::F32(val) => RuntimeValue::F32(val.into()),
+									wasmer::Val::F64(val) => RuntimeValue::F64(val.into()),
+									_ =>
+										return Err(wasmi::Error::Function(format!(
+											"Unsupported return value: {:?}",
+											wasm_value,
+										))),
+								};
 
-							Some(wasmer_value)
-						} else {
-							None
-						};
-
-						Ok(wasmer_result)
+								Ok(wasmer_value)
+							})
+							.transpose()
 					},
 				}
 			})
-		})
 	}
 
 	/// Get the value from a global with the given `name`.
@@ -842,27 +840,26 @@ impl<FR> Store<FR> {
 	/// Note: Due to borrowing constraints dispatch thunk is now propagated using DTH
 	///
 	/// Returns uninitialized sandboxed module instance or an instantiation error.
-	pub fn instantiate<'a, FE, SCH, DTH>(
+	pub fn instantiate<FE>(
 		&mut self,
 		wasm: &[u8],
 		guest_env: GuestEnvironment,
 		state: u32,
+		dispatch_thunk: FR,
+		supervisor_externals: &mut FE,
 	) -> std::result::Result<UnregisteredInstance<FR>, InstantiationError>
 	where
-		FR: Clone + 'static,
-		FE: SandboxCapabilities<SupervisorFuncRef = FR> + 'a,
-		SCH: SandboxCapabilitiesHolder<SupervisorFuncRef = FR, SC = FE>,
-		DTH: DispatchThunkHolder<DispatchThunk = FR>,
+		FE: SandboxCapabilities<SupervisorFuncRef = FR>,
 	{
 		let backend_context = &self.backend_context;
 
 		let sandbox_instance = match backend_context {
 			BackendContext::Wasmi =>
-				Self::instantiate_wasmi::<FE, SCH, DTH>(wasm, guest_env, state)?,
+				Self::instantiate_wasmi(wasm, guest_env, state, dispatch_thunk, supervisor_externals)?,
 
 			#[cfg(feature = "wasmer-sandbox")]
 			BackendContext::Wasmer(context) =>
-				Self::instantiate_wasmer::<FE, SCH, DTH>(context, wasm, guest_env, state)?,
+				Self::instantiate_wasmer(context, wasm, guest_env, state, dispatch_thunk, supervisor_externals)?,
 		};
 
 		Ok(UnregisteredInstance { sandbox_instance })
@@ -877,37 +874,33 @@ impl<FR> Store<FR> {
 		instance_idx as u32
 	}
 
-	fn instantiate_wasmi<'a, FE, SCH, DTH>(
+	fn instantiate_wasmi<FE>(
 		wasm: &[u8],
 		guest_env: GuestEnvironment,
 		state: u32,
+		dispatch_thunk: FR,
+		supervisor_externals: &mut FE,
 	) -> std::result::Result<Rc<SandboxInstance<FR>>, InstantiationError>
 	where
-		FR: Clone + 'static,
-		FE: SandboxCapabilities<SupervisorFuncRef = FR> + 'a,
-		SCH: SandboxCapabilitiesHolder<SupervisorFuncRef = FR, SC = FE>,
-		DTH: DispatchThunkHolder<DispatchThunk = FR>,
+		FE: SandboxCapabilities<SupervisorFuncRef = FR>,
 	{
 		let wasmi_module =
 			Module::from_buffer(wasm).map_err(|_| InstantiationError::ModuleDecoding)?;
 		let wasmi_instance = ModuleInstance::new(&wasmi_module, &guest_env.imports)
 			.map_err(|_| InstantiationError::Instantiation)?;
 
-		let sandbox_instance = DTH::with_dispatch_thunk(|dispatch_thunk| {
-			Rc::new(SandboxInstance {
+		let sandbox_instance = Rc::new(SandboxInstance {
 				// In general, it's not a very good idea to use `.not_started_instance()` for
 				// anything but for extracting memory and tables. But in this particular case, we
 				// are extracting for the purpose of running `start` function which should be ok.
 				backend_instance: BackendInstance::Wasmi(
 					wasmi_instance.not_started_instance().clone(),
 				),
-				dispatch_thunk: dispatch_thunk.clone(),
+				dispatch_thunk,
 				guest_to_supervisor_mapping: guest_env.guest_to_supervisor_mapping,
-			})
-		});
+			});
 
-		SCH::with_sandbox_capabilities(|supervisor_externals| {
-			with_guest_externals(
+		with_guest_externals(
 				supervisor_externals,
 				&sandbox_instance,
 				state,
@@ -920,23 +913,19 @@ impl<FR> Store<FR> {
 					// automatically
 				},
 			)
-		})?;
-
-		Ok(sandbox_instance)
 	}
 
 	#[cfg(feature = "wasmer-sandbox")]
-	fn instantiate_wasmer<'a, FE, SCH, DTH>(
+	fn instantiate_wasmer<FE>(
 		context: &WasmerBackend,
 		wasm: &[u8],
 		guest_env: GuestEnvironment,
 		state: u32,
+		dispatch_thunk: FR,
+		supervisor_externals: &mut FE,
 	) -> std::result::Result<Rc<SandboxInstance<FR>>, InstantiationError>
 	where
-		FR: Clone + 'static,
-		FE: SandboxCapabilities<SupervisorFuncRef = FR> + 'a,
-		SCH: SandboxCapabilitiesHolder<SupervisorFuncRef = FR, SC = FE>,
-		DTH: DispatchThunkHolder<DispatchThunk = FR>,
+		FE: SandboxCapabilities<SupervisorFuncRef = FR>,
 	{
 		let module = wasmer::Module::new(&context.store, wasm)
 			.map_err(|_| InstantiationError::ModuleDecoding)?;
@@ -991,11 +980,12 @@ impl<FR> Store<FR> {
 						.func_by_guest_index(guest_func_index)
 						.ok_or(InstantiationError::ModuleDecoding)?;
 
-					let function = Self::wasmer_dispatch_function::<FE, SCH, DTH>(
+					let function = Self::wasmer_dispatch_function(
 						supervisor_func_index,
 						&context.store,
 						func_ty,
 						state,
+						supervisor_externals,
 					);
 
 					let exports = exports_map
@@ -1022,39 +1012,36 @@ impl<FR> Store<FR> {
 
 		Ok(Rc::new(SandboxInstance {
 			backend_instance: BackendInstance::Wasmer(instance),
-			dispatch_thunk: DTH::with_dispatch_thunk(|dispatch_thunk| dispatch_thunk.clone()),
+			dispatch_thunk,
 			guest_to_supervisor_mapping: guest_env.guest_to_supervisor_mapping,
 		}))
 	}
 
 	#[cfg(feature = "wasmer-sandbox")]
-	fn wasmer_dispatch_function<'a, FE, SCH, DTH>(
+	fn wasmer_dispatch_function<FE>(
 		supervisor_func_index: SupervisorFuncIndex,
 		store: &wasmer::Store,
 		func_ty: &wasmer::FunctionType,
 		state: u32,
+		supervisor_externals: &mut FE,
 	) -> wasmer::Function
 	where
-		FR: Clone + 'static,
-		FE: SandboxCapabilities<SupervisorFuncRef = FR> + 'a,
-		SCH: SandboxCapabilitiesHolder<SupervisorFuncRef = FR, SC = FE>,
-		DTH: DispatchThunkHolder<DispatchThunk = FR>,
+		FE: SandboxCapabilities<SupervisorFuncRef = FR>,
 	{
 		wasmer::Function::new(store, func_ty, move |params| {
-			SCH::with_sandbox_capabilities(|supervisor_externals| {
 				use sp_wasm_interface::Value;
 
 				// Serialize arguments into a byte vector.
 				let invoke_args_data = params
 					.iter()
 					.map(|val| match val {
-						wasmer::Val::I32(val) => Value::I32(*val),
-						wasmer::Val::I64(val) => Value::I64(*val),
-						wasmer::Val::F32(val) => Value::F32(f32::to_bits(*val)),
-						wasmer::Val::F64(val) => Value::F64(f64::to_bits(*val)),
-						_ => unimplemented!(),
+						wasmer::Val::I32(val) => Ok(Value::I32(*val)),
+						wasmer::Val::I64(val) => Ok(Value::I64(*val)),
+						wasmer::Val::F32(val) => Ok(Value::F32(f32::to_bits(*val))),
+						wasmer::Val::F64(val) => Ok(Value::F64(f64::to_bits(*val))),
+						_ => Err(wasmer::RuntimeError::new(format!("Unsupported function argument: {:?}", val)))
 					})
-					.collect::<Vec<_>>()
+					.collect::<std::result::Result<Vec<_>, _>>()?
 					.encode();
 
 				// Move serialized arguments inside the memory, invoke dispatch thunk and
@@ -1133,6 +1120,5 @@ impl<FR> Store<FR> {
 					Ok(vec![])
 				}
 			})
-		})
 	}
 }

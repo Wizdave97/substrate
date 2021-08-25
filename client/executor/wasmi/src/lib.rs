@@ -225,10 +225,8 @@ impl Sandbox for FunctionExecutor {
 			.instance(instance_id)
 			.map_err(|e| e.to_string())?;
 
-		let result = EXECUTOR
-			.set(self, || instance.invoke::<_, CapsHolder, ThunkHolder>(export_name, &args, state));
 
-		match result {
+		match instance.invoke(export_name, &args, state, self) {
 			Ok(None) => Ok(sandbox_primitives::ERR_OK),
 			Ok(Some(val)) => {
 				// Serialize return value and write it back into the memory.
@@ -281,11 +279,7 @@ impl Sandbox for FunctionExecutor {
 		};
 
 		let store = &mut *self.inner.sandbox_store.borrow_mut();
-		let result = EXECUTOR.set(self, || {
-			DISPATCH_THUNK.set(&dispatch_thunk, || {
-				store.instantiate::<_, CapsHolder, ThunkHolder>(wasm, guest_env, state)
-			})
-		});
+		let result = store.instantiate(wasm, guest_env, state, dispatch_thunk, self);
 
 		let instance_idx_or_err_code: u32 = match result.map(|i| i.register(store)) {
 			Ok(instance_idx) => instance_idx,
@@ -307,48 +301,6 @@ impl Sandbox for FunctionExecutor {
 			.instance(instance_idx)
 			.map(|i| i.get_global_val(name))
 			.map_err(|e| e.to_string())
-	}
-}
-
-/// Wasmi specific implementation of `SandboxCapabilitiesHolder` that provides
-/// sandbox with a scoped thread local access to a function executor.
-/// This is a way to calm down the borrow checker since host function closures
-/// require exclusive access to it.
-struct CapsHolder;
-
-scoped_tls::scoped_thread_local!(static EXECUTOR: FunctionExecutor);
-
-impl sandbox::SandboxCapabilitiesHolder for CapsHolder {
-	type SupervisorFuncRef = wasmi::FuncRef;
-	type SC = FunctionExecutor;
-
-	fn with_sandbox_capabilities<R, F: FnOnce(&mut Self::SC) -> R>(f: F) -> R {
-		assert!(EXECUTOR.is_set(), "wasmi executor is not set");
-		EXECUTOR.with(|executor| f(&mut executor.clone()))
-	}
-}
-
-/// Wasmi specific implementation of `DispatchThunkHolder` that provides
-/// sandbox with a scoped thread local access to a dispatch thunk.
-/// This is a way to calm down the borrow checker since host function closures
-/// require exclusive access to it.
-struct ThunkHolder;
-
-scoped_tls::scoped_thread_local!(static DISPATCH_THUNK: wasmi::FuncRef);
-
-impl sandbox::DispatchThunkHolder for ThunkHolder {
-	type DispatchThunk = wasmi::FuncRef;
-
-	fn with_dispatch_thunk<R, F: FnOnce(&mut Self::DispatchThunk) -> R>(f: F) -> R {
-		assert!(DISPATCH_THUNK.is_set(), "dispatch thunk is not set");
-		DISPATCH_THUNK.with(|thunk| f(&mut thunk.clone()))
-	}
-
-	fn initialize_thunk<R, F>(s: &Self::DispatchThunk, f: F) -> R
-	where
-		F: FnOnce() -> R,
-	{
-		DISPATCH_THUNK.set(s, f)
 	}
 }
 
